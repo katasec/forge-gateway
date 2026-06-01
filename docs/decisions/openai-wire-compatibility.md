@@ -74,8 +74,45 @@ expose.
   oapi-codegen; ogen is heavy; spec accuracy is best-effort.
 - **Adopt `go-openai` for types:** set aside for now — a client dependency for a
   tiny surface; Responses API coverage lags.
-- **Use `openai-go` for everything:** partial — suitable for response/stream
-  emission, unsuitable for request ingestion; may be used *within* `oaiwire`.
+- **Use `openai-go` for everything:** evaluated via a marshal spike and rejected
+  for emission — see below.
+
+## Marshal spike & decision (2026-06-01)
+
+Before any `oaiwire` refactor we ran a throwaway spike: construct the candidate
+`openai-go` response/event types, `json.Marshal` them, and diff against the
+gateway's current emitted JSON. Findings:
+
+- **`openai.Model`** — marshals to the exact `{id, created, object:"model",
+  owned_by}` shape. The only clean 1:1 replacement.
+- **`openai.ChatCompletion` / `ChatCompletionChunk`** — emit the correct core
+  fields but as a noisy, partly off-spec superset: `service_tier:""`, an
+  always-present `audio:{}` object, `refusal:""`, `tool_calls:null`, `logprobs`,
+  zero `usage` on every stream chunk, `finish_reason:""` on every delta.
+- **`responses.Response`** — unusable. Its `Output` is a flattened decode union,
+  so marshaling dumps every variant's fields (`type:"computer_screenshot"`,
+  `arguments:{"OfString":""}`, `action:{…}`, …) plus `error:{}` instead of
+  `null`. Flat events like `ResponseTextDeltaEvent` marshal fine, but the
+  `created`/`in_progress`/`completed` events embed a full `Response` and inherit
+  the breakage.
+
+Root cause: `openai-go`'s response types are built to be **decoded** (no
+`omitempty`, `respjson` metadata, decode-oriented unions), not produced. They do
+not yield clean server emission.
+
+**Decision:** SDK response types were evaluated and rejected for gateway emission
+because they marshal noisy/off-spec server responses; Forge Gateway will keep its
+small hand-rolled compatibility slice for now. Concretely:
+
+- Keep the small hand-rolled wire slice.
+- Do **not** introduce SDK coupling for response emission.
+- Do **not** create `oaiwire` as an isolation-only refactor today.
+- Do **not** replace the chat/stream/responses structs with SDK types.
+- `modelInfo -> openai.Model` is possible (the one clean win) but not worth a
+  separate change right now.
+
+Revisit only if the served surface grows materially or the maintenance cost of
+the hand-rolled slice becomes real.
 
 ## References
 
