@@ -1,20 +1,26 @@
-// Package server exposes a forge Agent behind an OpenAI-compatible HTTP API.
+// Package gateway exposes forge Agents behind an OpenAI-compatible HTTP API.
 //
-// It implements the minimal surface needed to point an existing OpenAI client
-// (set OPENAI_BASE_URL) at a forged agent: GET /v1/models lists the available
-// agents as models, and POST /v1/chat/completions runs the named agent's full
-// loop (the Engine owns the loop) and returns an OpenAI chat completion.
+// The Gateway implements the minimal surface needed to point an existing OpenAI
+// client (set OPENAI_BASE_URL) at a forged agent: GET /v1/models lists the
+// available agents as models, and POST /v1/chat/completions runs the named
+// agent's full loop (the Engine owns the loop) and returns an OpenAI chat
+// completion.
 //
-// The agent name is the OpenAI "model" field. The server is stateless: an
+// The agent name is the OpenAI "model" field. The Gateway is stateless: an
 // OpenAI client sends the full message history on every call, so the agents it
 // serves should be created with forge.Config{DisableMemory: true}.
-package server
+//
+// Agents are dependencies of the Gateway, not servers themselves; the Gateway
+// owns the HTTP lifecycle and routes requests to the selected forge-core Agent.
+package gateway
 
 import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -28,42 +34,85 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// Server routes OpenAI-compatible requests to forge Agents keyed by model name.
-type Server struct {
-	agents       map[string]*forge.Agent
-	defaultAgent string
-	mux          *http.ServeMux
+// Config holds the dependencies and settings for a Gateway. It is the single
+// place dependencies are injected.
+type Config struct {
+	// Addr is the listen address for the HTTP server (e.g. ":8787").
+	Addr string
+	// Agents maps the model name a client requests to the agent that serves it.
+	Agents map[string]*forge.Agent
+	// DefaultAgent names the agent used when a client requests an unknown model
+	// id. Empty means strict mode (unknown model -> 404).
+	DefaultAgent string
+	// Logger receives request and error logs. Defaults to log.Default() if nil.
+	Logger *log.Logger
 }
 
-// New builds a Server that serves the given agents. The map key is the model
-// name a client requests (e.g. "forged_reviewer").
-//
-// defaultAgent names the agent to use when a client requests a model that is
-// not a known agent — host GUIs/CLIs send their own model ids (e.g. "gpt-5.5")
-// that won't match an agent name. If defaultAgent is "" or unknown, an
-// unrecognized model returns 404 (strict mode).
-func New(agents map[string]*forge.Agent, defaultAgent string) *Server {
-	s := &Server{
-		agents:       agents,
-		defaultAgent: defaultAgent,
+// Gateway routes OpenAI-compatible requests to forge Agents keyed by model name
+// and owns the HTTP server lifecycle.
+type Gateway struct {
+	agents       map[string]*forge.Agent
+	defaultAgent string
+	logger       *log.Logger
+	mux          *http.ServeMux
+	httpServer   *http.Server
+}
+
+// New wires a Gateway from cfg. The map key in cfg.Agents is the model name a
+// client requests (e.g. "forged_reviewer").
+func New(cfg Config) *Gateway {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.Default()
+	}
+	g := &Gateway{
+		agents:       cfg.Agents,
+		defaultAgent: cfg.DefaultAgent,
+		logger:       logger,
 		mux:          http.NewServeMux(),
 	}
-	s.mux.HandleFunc("GET /v1/models", s.handleModels)
-	s.mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
-	s.mux.HandleFunc("POST /v1/responses", s.handleResponses)
-	return s
+	g.routes()
+	g.httpServer = &http.Server{Addr: cfg.Addr, Handler: g}
+	return g
+}
+
+// routes declares every endpoint the Gateway serves, in one place.
+func (g *Gateway) routes() {
+	g.mux.HandleFunc("GET /v1/models", g.handleModels)
+	g.mux.HandleFunc("POST /v1/chat/completions", g.handleChatCompletions)
+	g.mux.HandleFunc("POST /v1/responses", g.handleResponses)
+}
+
+// Start runs the HTTP server and blocks until it stops. A clean shutdown via
+// Stop returns nil rather than http.ErrServerClosed. Process lifecycle and
+// signal handling are the caller's responsibility.
+func (g *Gateway) Start(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := g.httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+// Stop gracefully shuts down the HTTP server, waiting for in-flight requests to
+// finish within ctx's deadline.
+func (g *Gateway) Stop(ctx context.Context) error {
+	return g.httpServer.Shutdown(ctx)
 }
 
 // resolve maps a requested model name to an agent, falling back to the
 // configured default agent for unrecognized model ids. It returns the agent and
 // the resolved agent name, or ok=false when no agent applies.
-func (s *Server) resolve(model string) (*forge.Agent, string, bool) {
-	if a, ok := s.agents[model]; ok {
+func (g *Gateway) resolve(model string) (*forge.Agent, string, bool) {
+	if a, ok := g.agents[model]; ok {
 		return a, model, true
 	}
-	if s.defaultAgent != "" {
-		if a, ok := s.agents[s.defaultAgent]; ok {
-			return a, s.defaultAgent, true
+	if g.defaultAgent != "" {
+		if a, ok := g.agents[g.defaultAgent]; ok {
+			return a, g.defaultAgent, true
 		}
 	}
 	return nil, "", false
@@ -72,10 +121,10 @@ func (s *Server) resolve(model string) (*forge.Agent, string, bool) {
 // ServeHTTP implements http.Handler. It logs each request's method, path, and
 // status so the serve path is debuggable when a host CLI (e.g. Codex) points at
 // it — an unexpected 404 on /v1/responses immediately shows a wire-API mismatch.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
-	s.mux.ServeHTTP(sw, r)
-	log.Printf("%s %s -> %d", r.Method, r.URL.Path, sw.status)
+	g.mux.ServeHTTP(sw, r)
+	g.logger.Printf("%s %s -> %d", r.Method, r.URL.Path, sw.status)
 }
 
 // statusWriter captures the response status for logging while preserving the
@@ -246,10 +295,10 @@ type modelInfo struct {
 	OwnedBy string `json:"owned_by"`
 }
 
-func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
+func (g *Gateway) handleModels(w http.ResponseWriter, _ *http.Request) {
 	now := time.Now().Unix()
 	list := modelList{Object: "list"}
-	for name := range s.agents {
+	for name := range g.agents {
 		list.Data = append(list.Data, modelInfo{
 			ID:      name,
 			Object:  "model",
@@ -257,38 +306,38 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 			OwnedBy: "forge",
 		})
 	}
-	writeJSON(w, http.StatusOK, list)
+	g.writeJSON(w, http.StatusOK, list)
 }
 
-func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	data, err := readBody(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
+		g.writeError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
 		return
 	}
 	var req chatRequest
 	if err := json.Unmarshal(data, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "could not parse request body")
+		g.writeError(w, http.StatusBadRequest, "invalid_request_error", "could not parse request body")
 		return
 	}
 
-	log.Printf("chat: model=%q stream=%v messages=%d", req.Model, req.Stream, len(req.Messages))
+	g.logger.Printf("chat: model=%q stream=%v messages=%d", req.Model, req.Stream, len(req.Messages))
 
-	agent, resolved, ok := s.resolve(req.Model)
+	agent, resolved, ok := g.resolve(req.Model)
 	if !ok {
-		writeError(w, http.StatusNotFound, "invalid_request_error",
+		g.writeError(w, http.StatusNotFound, "invalid_request_error",
 			fmt.Sprintf("model %q does not exist", req.Model))
 		return
 	}
 	if resolved != req.Model {
-		log.Printf("chat: model %q -> agent %q (default)", req.Model, resolved)
+		g.logger.Printf("chat: model %q -> agent %q (default)", req.Model, resolved)
 	}
 
 	resp, err := agent.Run(r.Context(), forge.AgentRequest{
 		Messages: translateMessages(req.Messages),
 	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		g.writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 
@@ -298,11 +347,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	finish := toOAIFinish(resp.FinishReason)
 
 	if req.Stream {
-		writeStream(w, id, created, req.Model, text, finish)
+		g.writeStream(w, id, created, req.Model, text, finish)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, chatResponse{
+	g.writeJSON(w, http.StatusOK, chatResponse{
 		ID:      id,
 		Object:  "chat.completion",
 		Created: created,
@@ -371,10 +420,10 @@ func totalTokens(u forge.TokenUsage) int {
 // is delivered in a single delta rather than token-by-token. The endpoint still
 // speaks SSE so that clients requiring stream:true work; true token streaming
 // depends on a streaming Provider, which the Engine does not yet expose.
-func writeStream(w http.ResponseWriter, id string, created int64, model, text, finish string) {
+func (g *Gateway) writeStream(w http.ResponseWriter, id string, created int64, model, text, finish string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported")
+		g.writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported")
 		return
 	}
 
@@ -387,7 +436,7 @@ func writeStream(w http.ResponseWriter, id string, created int64, model, text, f
 	send := func(c streamChunk) {
 		b, err := json.Marshal(c)
 		if err != nil {
-			log.Printf("chat stream: marshal chunk: %v", err)
+			g.logger.Printf("chat stream: marshal chunk: %v", err)
 			return
 		}
 		fmt.Fprintf(w, "data: %s\n\n", b)
@@ -414,16 +463,16 @@ func writeStream(w http.ResponseWriter, id string, created int64, model, text, f
 	flusher.Flush()
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func (g *Gateway) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("writeJSON: encode response: %v", err)
+		g.logger.Printf("writeJSON: encode response: %v", err)
 	}
 }
 
-func writeError(w http.ResponseWriter, status int, errType, msg string) {
-	writeJSON(w, status, map[string]any{
+func (g *Gateway) writeError(w http.ResponseWriter, status int, errType, msg string) {
+	g.writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
 			"type":    errType,

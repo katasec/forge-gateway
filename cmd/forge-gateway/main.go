@@ -14,17 +14,23 @@
 //
 // The two demo agents share one provider and model and differ only in their
 // scaffold — the north-star demo: same model, same task, different package.
+//
+// This command owns process lifecycle: it starts the Gateway, waits for an
+// interrupt/terminate signal, then asks the Gateway to shut down gracefully.
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
-	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/katasec/forge-core"
 	"github.com/katasec/forge-core/provider/openai"
-	"github.com/katasec/forge-gateway/server"
+	"github.com/katasec/forge-gateway/gateway"
 )
 
 const forgedReviewerScaffold = `You are a repository reviewer operating under a mission scaffold.
@@ -37,6 +43,9 @@ Operating rules:
 - Keep output structured: Findings, Next Improvement, Verification.`
 
 const vanillaScaffold = "You are a helpful coding assistant. Review the repository."
+
+// shutdownTimeout bounds how long Stop waits for in-flight requests to drain.
+const shutdownTimeout = 10 * time.Second
 
 func main() {
 	addr := flag.String("addr", ":8787", "address to listen on")
@@ -62,11 +71,36 @@ func main() {
 		"forged_reviewer":  mustAgent(provider, forgedReviewerScaffold),
 	}
 
-	srv := server.New(agents, *defaultAgent)
+	gw := gateway.New(gateway.Config{
+		Addr:         *addr,
+		Agents:       agents,
+		DefaultAgent: *defaultAgent,
+	})
+
 	log.Printf("forge-gateway serving %d agents on %s (upstream model %s, default agent %q)", len(agents), *addr, *model, *defaultAgent)
 	log.Printf("point your client at: export OPENAI_BASE_URL=http://localhost%s/v1", *addr)
-	if err := http.ListenAndServe(*addr, srv); err != nil {
-		log.Fatal(err)
+
+	// main owns OS signal handling; the gateway owns Start/Stop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- gw.Start(ctx) }()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Fatalf("forge-gateway: %v", err)
+		}
+	case <-ctx.Done():
+		stop() // restore default signal handling so a second signal force-quits
+		log.Printf("forge-gateway shutting down…")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := gw.Stop(shutdownCtx); err != nil {
+			log.Fatalf("forge-gateway shutdown: %v", err)
+		}
+		log.Printf("forge-gateway stopped")
 	}
 }
 

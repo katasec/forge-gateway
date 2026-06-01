@@ -1,4 +1,4 @@
-package server
+package gateway
 
 import (
 	"context"
@@ -31,7 +31,7 @@ func (p *recordingProvider) Generate(_ context.Context, req forge.ProviderReques
 	}, nil
 }
 
-func newTestServer(t *testing.T, prov forge.Provider) *Server {
+func newTestServer(t *testing.T, prov forge.Provider) *Gateway {
 	t.Helper()
 	agent, err := forge.NewAgent(forge.Config{
 		Provider:      prov,
@@ -41,12 +41,12 @@ func newTestServer(t *testing.T, prov forge.Provider) *Server {
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	return New(map[string]*forge.Agent{"forged_reviewer": agent}, "")
+	return New(Config{Agents: map[string]*forge.Agent{"forged_reviewer": agent}})
 }
 
 // newTestServerWithDefault is like newTestServer but configures a default agent
 // so unknown model ids fall back instead of 404ing.
-func newTestServerWithDefault(t *testing.T, prov forge.Provider, def string) *Server {
+func newTestServerWithDefault(t *testing.T, prov forge.Provider, def string) *Gateway {
 	t.Helper()
 	agent, err := forge.NewAgent(forge.Config{
 		Provider:      prov,
@@ -56,7 +56,7 @@ func newTestServerWithDefault(t *testing.T, prov forge.Provider, def string) *Se
 	if err != nil {
 		t.Fatalf("NewAgent: %v", err)
 	}
-	return New(map[string]*forge.Agent{"forged_reviewer": agent}, def)
+	return New(Config{Agents: map[string]*forge.Agent{"forged_reviewer": agent}, DefaultAgent: def})
 }
 
 func TestModelsListsAgents(t *testing.T) {

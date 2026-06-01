@@ -1,9 +1,8 @@
-package server
+package gateway
 
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
@@ -100,40 +99,40 @@ type responsesUsage struct {
 	TotalTokens  int `json:"total_tokens"`
 }
 
-func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleResponses(w http.ResponseWriter, r *http.Request) {
 	data, err := readBody(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
+		g.writeError(w, http.StatusBadRequest, "invalid_request_error", "could not read request body")
 		return
 	}
 
 	var req responsesRequest
 	if err := json.Unmarshal(data, &req); err != nil {
-		log.Printf("responses: decode error: %v; raw=%s", err, truncate(data, 2000))
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "could not parse request body")
+		g.logger.Printf("responses: decode error: %v; raw=%s", err, truncate(data, 2000))
+		g.writeError(w, http.StatusBadRequest, "invalid_request_error", "could not parse request body")
 		return
 	}
 
-	log.Printf("responses: model=%q stream=%v messages=%d", req.Model, req.Stream, len(req.Input.messages))
+	g.logger.Printf("responses: model=%q stream=%v messages=%d", req.Model, req.Stream, len(req.Input.messages))
 	if len(req.Input.messages) == 0 {
 		// We accepted the body but extracted no user content — log the raw
 		// payload so the parser can be matched to Codex's exact schema.
-		log.Printf("responses: WARNING parsed 0 messages; raw=%s", truncate(data, 2000))
+		g.logger.Printf("responses: WARNING parsed 0 messages; raw=%s", truncate(data, 2000))
 	}
 
-	agent, resolved, ok := s.resolve(req.Model)
+	agent, resolved, ok := g.resolve(req.Model)
 	if !ok {
-		writeError(w, http.StatusNotFound, "invalid_request_error",
+		g.writeError(w, http.StatusNotFound, "invalid_request_error",
 			fmt.Sprintf("model %q does not exist", req.Model))
 		return
 	}
 	if resolved != req.Model {
-		log.Printf("responses: model %q -> agent %q (default)", req.Model, resolved)
+		g.logger.Printf("responses: model %q -> agent %q (default)", req.Model, resolved)
 	}
 
 	resp, err := agent.Run(r.Context(), forge.AgentRequest{Messages: req.Input.messages})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		g.writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 
@@ -164,20 +163,20 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		writeResponsesStream(w, completed, itemID, text)
+		g.writeResponsesStream(w, completed, itemID, text)
 		return
 	}
-	writeJSON(w, http.StatusOK, completed)
+	g.writeJSON(w, http.StatusOK, completed)
 }
 
 // writeResponsesStream emits the Responses streaming protocol: named SSE events
 // terminating in response.completed. The Engine runs to completion first, so
 // the text is delivered as a single output_text delta rather than token by
 // token; the event envelope is what Codex needs to consume a streamed turn.
-func writeResponsesStream(w http.ResponseWriter, completed responsesResponse, itemID, text string) {
+func (g *Gateway) writeResponsesStream(w http.ResponseWriter, completed responsesResponse, itemID, text string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported")
+		g.writeError(w, http.StatusInternalServerError, "server_error", "streaming unsupported")
 		return
 	}
 
@@ -194,7 +193,7 @@ func writeResponsesStream(w http.ResponseWriter, completed responsesResponse, it
 		seq++
 		b, err := json.Marshal(data)
 		if err != nil {
-			log.Printf("responses stream: marshal %s event: %v", eventType, err)
+			g.logger.Printf("responses stream: marshal %s event: %v", eventType, err)
 			return
 		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, b)
